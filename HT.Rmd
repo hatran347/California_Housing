@@ -1,0 +1,1431 @@
+---
+title: "California Housing"
+author: "Ha Tran"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    keep_tex: true
+    fig_crop: false
+mainfont: "Times New Roman"
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  #dev = "jpeg",
+  dpi = 100,
+  fig.width = 8,
+  fig.height = 5
+)
+
+library(tidyverse)
+library(corrplot)
+library(broom)
+library(knitr)
+library(maps)
+library(viridis)
+library(scales)
+library(GGally)
+library(car)
+library(glmnet)
+```
+
+# Tiền xử lý dữ liệu
+
+## Đọc dữ liệu
+
+```{r echo =TRUE}
+df_housing = read.csv("../California_housing.csv")
+```
+
+## Cấu trúc dữ liệu
+
+```{r echo = TRUE}
+glimpse(df_housing)
+dim(df_housing)
+names(df_housing)
+summary(df_housing)
+```
+
+Bộ dữ liệu gồm 20,640 quan sát và 10 biến. Trong đó median_house_value là biến mục tiêu cần dự đoán. Biến ocean_proximity là biến định tính, các biến còn lại là biến số. Longitude và latitude thể hiện vị trí địa lý; housingMedianAge, totalRooms, totalBedrooms mô tả đặc điểm nhà ở; population và households phản ánh quy mô dân cư; medianIncome thể hiện mức thu nhập trung vị của hộ gia đình.
+
+## Kiểm tra chất lượng dữ liệu
+
+### Duplicate
+
+```{r, echo = TRUE}
+duplicate_count <- sum(duplicated(df_housing))
+duplicate_count
+```
+
+Không phát hiện quan sát bị trùng lặp trong dữ liệu. Do đó, không cần loại bỏ duplicate.
+
+### Missing/Null và xử lý
+
+```{r}
+missing_table <- data.frame(
+  variable = names(df_housing),
+  missing_count = colSums(is.na(df_housing)),
+  missing_percent = colSums(is.na(df_housing)) / nrow(df_housing) * 100
+)
+
+missing_table
+```
+
+Dữ liệu chỉ có missing value ở biến total_bedrooms với 207 giá trị thiếu, chiếm khoảng 1% tổng số quan sát. Phương pháp được lựa chọn để xử lý missing value là trung vị. Lý do là biến total_bedrooms có phân phối lệch phải khá mạnh: 75% số quan sát có giá trị không vượt quá 647, trong khi giá trị lớn nhất lên đến 6445. Vì vậy, nếu sử dụng trung bình để thay thế, giá trị thay thế có thể bị kéo lên bởi các giá trị ngoại lai lớn. Trung vị là lựa chọn phù hợp hơn vì ít bị ảnh hưởng bởi outlier và phản ánh tốt hơn xu hướng trung tâm của biến này.
+
+
+```{r}
+median_total_bedrooms <- median(df_housing$total_bedrooms, na.rm= TRUE)
+
+df_housing <- df_housing %>% 
+  mutate(total_bedrooms_imputed = if_else(is.na(total_bedrooms), median_total_bedrooms, total_bedrooms)
+         )
+# biến này được fill_na trước, nhưng chỉ sử dụng khi mô hình bắt đầu học dữ liệu
+```
+
+
+## Phân phối biến mục tiêu median_house_value
+
+```{r}
+ggplot(df_housing, aes(x = median_house_value)) +
+  geom_histogram(bins = 50, fill = "gray80", color = "black") +
+  labs(
+    title = "Phan phoi bien target median_house_value",
+    x = "Median house value",
+    y = "Tần số"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(df_housing, aes(y = median_house_value)) +
+  geom_boxplot(fill = "gray85", color = "black") +
+  labs(
+    title = "Boxplot median_house_value",
+    y = "Median house value"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+df_housing %>%
+  filter(median_house_value == 500001) %>%
+  summarise(
+    n = n(),
+    percent = n() / nrow(df_housing) * 100
+  )
+```
+
+Dựa vào histogram và boxplot, biến `median_house_valu`e có phân phối lệch phải. Phần lớn quan sát tập trung ở vùng giá thấp và trung bình, khoảng từ 100,000 đến 300,000, sau đó tần suất giảm dần ở các mức giá cao hơn. Tuy nhiên, tại vùng gần 500,000 xuất hiện một cột có tần suất cao bất thường.
+
+Kết quả kiểm tra cho thấy có nhiều quan sát có giá trị` median_house_value` bằng 500001. Đây có thể là hiện tượng capping của biến mục tiêu, tức các giá trị nhà ở vượt một ngưỡng nhất định được ghi nhận chung tại mức 500001. Vì vậy, đây không nên được xem là outlier đơn lẻ thông thường, mà là một đặc điểm của dữ liệu gốc.
+
+
+## Phân tích các biến định lượng
+
+### Kiểm tra phân phối của các biến định lượng 
+
+```{r}
+# tạo list chứa danh sách biến số
+numeric_var <- df_housing %>% 
+  select(longitude, latitude, housing_median_age,total_rooms, total_bedrooms, population,
+          households, median_income)
+
+# histogram
+numeric_var %>% pivot_longer(col = everything(),
+                             names_to = 'variable', values_to = 'value')  %>%
+            ggplot(aes(x = value)) +
+                geom_histogram(bins = 40, fill = "gray80", color = "black") +
+                facet_wrap(~ variable, scales = "free") +
+                labs(
+                title = "Histogram cac bien dinh luong",
+                 x = "Gia tri",
+                y = "Tan so"
+                 ) + theme_minimal()
+```
+
+Dựa vào histogram của các biến định lượng, có thể thấy các biến households, total_bedrooms, total_rooms và population có phân phối lệch phải rất mạnh. Phần lớn quan sát tập trung ở vùng giá trị thấp, trong khi một số quan sát có giá trị rất lớn. Điều này phù hợp với bản chất dữ liệu vì các biến này là số liệu tổng hợp ở cấp độ khu vực dân số (census block group), không phải đặc điểm của từng căn nhà riêng lẻ.
+
+Biến median_income cũng có phân phối lệch phải, cho thấy phần lớn khu vực có mức thu nhập trung vị ở mức thấp đến trung bình, trong khi chỉ một số ít khu vực có thu nhập rất cao. Hai biến longitude và latitude không có dạng phân phối chuẩn rõ ràng vì đây là biến tọa độ địa lý, phản ánh vị trí không gian của các khu vực tại California.
+
+Đối với biến housing_median_age, phân phối không có dạng chuẩn rõ ràng và xuất hiện sự tập trung đáng chú ý tại giá trị 52. Điều này có thể cho thấy biến này được giới hạn ở một mức trần nhất định, tương tự hiện tượng capping ở biến mục tiêu median_house_value.
+
+Từ đặc điểm phân phối trên, đặc biệt là sự lệch phải và sự xuất hiện của các giá trị lớn ở một số biến tổng, bài làm tiếp tục kiểm tra outlier và phân tích mối liên hệ giữa các biến trong các phần tiếp theo.
+
+### Kiểm tra Outlier
+
+```{r}
+numeric_var %>% pivot_longer(cols = everything(),
+                             names_to = 'variable', values_to = 'value') %>% 
+  ggplot (aes(x= variable, y=value)) +
+  geom_boxplot(fill = 'gray', color = 'black')+
+  facet_wrap(~ variable, scales = 'free') +
+  labs( title = 'Box plot bien dinh luong',
+        x = 'variable',
+        y = "value") 
+
+```
+
+Chi tiết thông tin outlier phát hiện bằng phương pháp IQR:
+```{r}
+# Hàm chứa thông tin outlier
+get_outlier_info <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr_value <- q3 - q1
+  
+  lower_bound <- q1 - 1.5 * iqr_value
+  upper_bound <- q3 + 1.5 * iqr_value
+  
+  tibble(
+    Q1 = q1,
+    Q3 = q3,
+    IQR = iqr_value,
+    Lower_Bound = lower_bound,
+    Upper_Bound = upper_bound,
+    Min = min(x, na.rm = TRUE),
+    Max = max(x, na.rm = TRUE),
+    Outlier_Count = sum(x < lower_bound | x > upper_bound, na.rm = TRUE),
+    Outlier_Percent = sum(x < lower_bound | x > upper_bound, na.rm = TRUE) / nrow(df_housing) * 100
+  )
+}
+
+#
+outlier_info <- numeric_var %>%
+  summarise(across(everything(), list)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "values"
+  ) %>%
+  mutate(info = purrr::map(values, get_outlier_info)) %>%
+  select(variable, info) %>%
+  tidyr::unnest(info) %>%
+  arrange(desc(Outlier_Percent))
+
+knitr::kable(outlier_info, digits = 2)
+
+```
+
+Dựa vào boxplot và phương pháp IQR, có thể thấy các biến longitude, latitude và housing_median_age không xuất hiện outlier theo quy tắc IQR. Trong khi đó, các biến total_rooms, total_bedrooms, households, population và median_income đều có outlier. Đáng chú ý, các biến total_rooms, total_bedrooms, households và population có số lượng outlier khá lớn, khoảng trên 1,000 quan sát, tương đương khoảng 5%–6% dữ liệu.
+
+Tuy nhiên, mỗi quan sát trong bộ dữ liệu đại diện cho một census block group chứ không phải một căn nhà riêng lẻ. Do đó, các giá trị lớn ở những biến như population, households, total_rooms và total_bedrooms có thể phản ánh những khu vực có quy mô dân cư lớn, nhiều hộ gia đình hoặc nhiều phòng  Đối với median_income, các outlier có thể phản ánh một số khu vực có mức thu nhập trung vị cao hơn đáng kể so với phần lớn dữ liệu.
+
+Vì vậy, không loại bỏ trực tiếp các outlier ở bước này. Thay vào đó, bài làm sẽ sử dụng thêm phân tích heatmap theo vị trí địa lý để đánh giá liệu các giá trị lớn có xu hướng tập trung ở một số khu vực nhất định hay không. Nếu các giá trị lớn có tính tập trung theo không gian, điều này sẽ củng cố lập luận rằng outlier có thể phản ánh đặc điểm thật của dữ liệu thay vì lỗi nhập liệu.
+
+Ngoài ra, housing_median_age không được xác định là outlier theo quy tắc IQR, phân phối của biến này có sự tập trung tại giá trị 52, cho thấy biến có thể được giới hạn ở một mức trần nhất định.
+
+### Kiểm tra bằng heatmap và phân tích địa lí
+
+```{r, include = FALSE}
+california_map <- map_data("state") %>% filter(region == "california")
+
+```
+
+```{r}
+ggplot() +
+  geom_polygon(
+    data = california_map,
+    aes(x = long, y = lat, group = group),
+    fill = "gray95",
+    color = "gray60"
+  ) +
+  geom_point(
+    data = df_housing,
+    aes(x = longitude,y = latitude,color = median_house_value),
+    alpha = 0.5,
+    size = 1
+  ) +
+  scale_color_viridis_c(labels = comma,option = "plasma") +
+  coord_quickmap() +
+  labs(
+    title = "Phan bo gia nha theo vi tri dia ly tai California",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Median house value"
+  ) +theme_minimal()
+```
+```{r}
+ggplot() +
+  geom_polygon(
+    data = california_map,
+    aes(x = long, y = lat, group = group),
+    fill = "gray95",
+    color = "gray60"
+  ) +
+  geom_point(
+    data = df_housing,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = median_house_value,
+      size = population
+    ),
+    alpha = 0.4
+  ) +
+  scale_color_viridis_c(labels = comma,option = "plasma") +
+  scale_size_continuous(range = c(0.5, 5),labels = comma) +
+  coord_quickmap() +
+  labs(
+    title = "Gia nha va dan so theo vi tri dia ly",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Median house value",
+    size = "Population"
+  ) +theme_minimal()
+```
+
+```{r}
+ggplot() +
+  geom_polygon(
+    data = california_map,
+    aes(x = long, y = lat, group = group),
+    fill = "gray95",
+    color = "gray70"
+  ) +
+  stat_summary_2d(
+    data = df_housing,
+    aes(x = longitude,y = latitude,z = population),bins = 60,fun = mean
+  ) +
+  scale_fill_viridis_c(labels = comma,option = "magma") +
+  coord_quickmap() +
+  labs(
+    title = "Heatmap dan so trung binh theo vi tri dia li",
+    x = "Longitude",
+    y = "Latitude",
+    fill = "Mean population"
+  ) +
+  theme_minimal()
+```
+
+Các biểu đồ theo vị trí địa lý cho thấy giá nhà có sự phân hóa rõ rệt theo không gian. Những khu vực gần biển có xu hướng có median_house_value cao hơn so với khu vực nội địa, điều này sẽ được xác thực qua việc phân tích biến định tính ở dưới.
+
+Bên cạnh đó, khi kết hợp thêm biến population và quan sát heatmap theo vị trí địa lý, có thể thấy các giá trị lớn không xuất hiện hoàn toàn ngẫu nhiên mà có xu hướng tập trung tại một số khu vực nhất định. Điều này cho thấy các outlier ở các biến tổng như population, total_rooms và households không hẳn là lỗi nhập liệu của quá trình điều tra dân số, mà có thể phản ánh đặc điểm thật của những census block group có quy mô lớn.
+
+Đối với total_rooms, do biến này là tổng số phòng trong toàn bộ khu vực điều tra dân số, các giá trị lớn có thể xuất hiện ở những khu vực có nhiều hộ gia đình hoặc nhiều đơn vị nhà ở. Vì vậy, không loại bỏ trực tiếp các outlier này. Thay vào đó, ở bước feature engineering, biến rooms_per_household sẽ được tạo thêm để chuẩn hóa số phòng theo số hộ gia đình và giúp mô hình diễn giải tốt hơn.
+
+
+
+
+## Phân phối biến định tính ocean_proximity
+```{r}
+ggplot(df_housing, mapping = aes(ocean_proximity)) +
+  geom_bar(stat = "count", fill = "gray" , color = "black") +
+  labs (title = "So luong quan sat theo bien ocean_proximity ",
+        x = "Gia tri",
+        y = "Tan so") + theme_minimal()
+```
+
+```{r}
+ggplot(data = df_housing, mapping = aes(x = ocean_proximity, y = median_house_value)) +
+  geom_boxplot(fill = "gray", color = "black") +
+  labs(title = "So sanh su khac nhau giua gia nha voi cac nhom",
+       x = "ocean_proximity",
+       y = "median_house_value") + theme_minimal()
+  
+```
+
+Dựa vào bar chart và boxplot, có thể thấy phần lớn số lượng quan sát tập trung ở hai nhóm "<1H OCEAN" và "INLAND", trong khi nhóm "ISLAND" có số lượng quan sát rất ít. Ngoài ra, boxplot cho thấy phân phối giá nhà có sự khác biệt rõ rệt giữa các nhóm ocean_proximity. Cụ thể, nhóm INLAND có giá nhà trung vị thấp hơn đáng kể so với các nhóm gần biển như <1H OCEAN, NEAR BAY và NEAR OCEAN. Điều này cho thấy vị trí so với biển là một yếu tố quan trọng ảnh hưởng đến giá nhà. Tuy nhiên, nhóm ISLAND cần được diễn giải thận trọng do số lượng quan sát quá nhỏ.
+
+## Phân tích tương quan
+### Kiểm tra sự tương quan giữa các biến dự báo và biến mục tiêu
+```{r}
+df_housing %>%
+  select(
+    median_house_value,
+    longitude,
+    latitude,
+    housing_median_age,
+    total_rooms,
+    total_bedrooms_imputed,
+    population,
+    households,
+    median_income
+  ) %>%
+  pivot_longer(
+    cols = -median_house_value,
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = value, y = median_house_value)) +
+  geom_point(alpha = 0.25, size = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(
+    title = "Scatter plot numeric vars and median_house_value",
+    x = "Variable",
+    y = "Median house value"
+  ) +
+  theme_minimal()
+
+```
+
+Scatter plot giữa các biến định lượng và median_house_value cho thấy median_income có xu hướng tuyến tính dương rõ rệt nhất với giá nhà. Khi median_income tăng, median_house_value cũng có xu hướng tăng. Ngược lại, các biến tổng như total_rooms, total_bedrooms_imputed, population và households có mối quan hệ kém rõ ràng hơn với biến mục tiêu, dù xuất hiện nhiều giá trị lớn. Điều này cho thấy quy mô của census block group không trực tiếp giải thích mạnh cho giá nhà bằng yếu tố thu nhập trung vị.
+
+
+###  Kiểm tra sự tương quan giữa các biến định lượng 
+
+
+```{r}
+cor_data <- df_housing %>%
+  select(
+    longitude,
+    latitude,
+    housing_median_age,
+    total_rooms,
+    total_bedrooms_imputed,
+    population,
+    households,
+    median_income,
+    median_house_value
+  )
+
+cor_mat <- cor(cor_data, use = "complete.obs")
+
+corrplot(cor_mat,method = "color",type = "upper",
+  tl.cex = 0.8,
+  addCoef.col = "black",
+  number.cex = 0.6
+)
+```
+
+Dựa vào ma trận tương quan, có thể thấy nhóm biến tổng gồm total_rooms, total_bedrooms_imputed, population và households có tương quan rất cao với nhau. Điều này là hợp lý vì các biến này đều phản ánh quy mô của một census block group: khu vực có nhiều hộ gia đình thường cũng có tổng số phòng, tổng số phòng ngủ và dân số lớn hơn. Tuy nhiên, mức tương quan cao giữa các biến giải thích cũng cho thấy khả năng tồn tại đa cộng tuyến trong mô hình OLS.
+
+Đối với biến mục tiêu median_house_value, median_income là biến có tương quan dương mạnh nhất, với hệ số tương quan khoảng 0.69. Điều này cho thấy các khu vực có thu nhập trung vị cao hơn thường có xu hướng có giá nhà trung vị cao hơn. Trong khi đó, các biến tổng như total_rooms, total_bedrooms_imputed, population và households chỉ có tương quan yếu với median_house_value, cho thấy bản thân quy mô khu vực chưa đủ để giải thích trực tiếp giá nhà.
+
+Kết quả này gợi ý rằng median_income là một biến giải thích quan trọng trong bài toán dự đoán giá nhà. Đồng thời, do tồn tại tương quan cao giữa một số biến giải thích, việc sử dụng các mô hình hồi quy điều chuẩn như Ridge, LASSO và Elastic Net là phù hợp nhằm hạn chế ảnh hưởng của đa cộng tuyến và cải thiện tính ổn định của mô hình.
+
+###  Kiểm tra hiện tượng đa cộng tuyến bằng VIF
+
+```{r}
+# tạo mô hình tạm để tính VIF
+
+vif_model <- lm(
+  median_house_value ~ longitude + latitude + housing_median_age +
+    total_rooms + total_bedrooms_imputed + population +
+    households + median_income,
+  data = df_housing
+)
+
+vif_values <- vif(vif_model)
+
+vif_table <- data.frame(
+  variable = names(vif_values),
+  VIF = as.numeric(vif_values)
+) %>%
+  arrange(desc(VIF))
+
+kable(vif_table, digits = 3)
+```
+
+Ma trận tương quan và chỉ số VIF cho thấy một số biến giải thích có dấu hiệu đa cộng tuyến. Cụ thể, nhóm biến total_rooms, total_bedrooms_imputed, population và households có VIF cao (> 10), cho thấy các biến này chia sẻ nhiều thông tin do cùng phản ánh quy mô của census block group. Điều này phù hợp với bản chất dữ liệu, vì khu vực có nhiều hộ gia đình thường cũng có nhiều phòng, nhiều phòng ngủ và dân số lớn hơn.
+
+Tuy nhiên, bài làm không loại bỏ biến chỉ dựa trên VIF. Các mô hình sẽ được đánh giá trên tập validation bằng RMSE, MAE, MAPE và R². Đồng thời, để giảm sự chồng lắp thông tin giữa các biến tổng báo cáo này sẽ thêm 1 phần Feature Engineering để tạo thêm 1 vài biến giải thích mới để chuẩn hóa thông tin theo quy mô hộ gia đình và có ý nghĩa diễn giải tốt hơn.
+
+#  Feature Engineering
+
+```{r feature-engineering, echo=TRUE}
+df_housing <- df_housing %>%
+  mutate(
+    rooms_per_household = total_rooms / households,
+    bedrooms_per_room = total_bedrooms_imputed  / total_rooms,
+    population_per_household = population / households
+  )
+
+
+summary(
+  df_housing %>%
+    select(
+      rooms_per_household,
+      bedrooms_per_room,
+      population_per_household
+    )
+)
+```
+
+
+```{r}
+df_housing %>%
+  select(
+    rooms_per_household,
+    bedrooms_per_room,
+    population_per_household
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 40, fill = "gray80", color = "black") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(
+    title = "Histogram cua cac bien duoc tao moi",
+    x = "Gia tri",
+    y = "Tan so"
+  ) +
+  theme_minimal()
+```
+
+Các biến được thêm vào vẫn có phân phối lệch phải, đặc biệt là rooms_per_household và population_per_household. Điều này cho thấy vẫn tồn tại một số census block group có tỷ lệ số phòng hoặc số người trên mỗi hộ rất cao. 
+
+#  Chia train/validation set
+
+Báo cáo này sử dụng các biến mới được tạo ở phần trước đó thay thế cho các biến có tương quan cao, dataframe ban đầu sẽ được filter thành 1 dataframe mới và chỉ lấy các biến cần sử dụng.
+
+
+```{r}
+df_model_use <- df_housing %>%
+  select(
+    median_house_value,
+    longitude,
+    latitude,
+    housing_median_age,
+    total_rooms,
+    total_bedrooms_imputed,
+    population,
+    households,
+    median_income,
+    ocean_proximity,
+    rooms_per_household,
+    bedrooms_per_room,
+    population_per_household
+  )
+
+# Kiem tra null
+colSums(is.na(df_model_use))  
+```
+
+
+```{r, echo = TRUE}
+set.seed(347)
+
+n <- nrow(df_model_use)
+train_id <- sample(seq_len(n), size = 0.8 * n)
+
+train_model <- df_model_use[train_id, ]
+val_model  <- df_model_use[-train_id, ]
+```
+
+```{r}
+dim(train_model)
+dim(val_model)
+```
+# Xây dựng mô hình bằng OLS
+
+## Xử lý biến định tính
+
+```{r, echo = TRUE}
+# Chuyển biến định tính ocean_proximity sang factor
+train_model$ocean_proximity <- relevel(as.factor(train_model$ocean_proximity),ref = "INLAND")
+#set tham chiếu là INLAND vì trong R, nếu ko set tham chiếu R sẽ mặc định là loại đầu tiên
+
+# Đảm bảo test set có cùng level với train set
+val_model$ocean_proximity <- factor(
+  val_model$ocean_proximity,
+  levels = levels(train_model$ocean_proximity)
+)
+```
+
+
+##  Xây dựng mô hình bằng OLS:
+
+###  OLS full mô hình
+
+
+```{r echo=TRUE}
+ols_full <- lm(
+  median_house_value ~ .,
+  data = train_model
+)
+
+summary(ols_full)
+
+```
+
+Mô hình OLS Full được sử dụng làm mô hình tuyến tính cơ sở để so sánh với các mô hình điều chuẩn. Kết quả cho thấy mô hình có ý nghĩa thống kê tổng thể với p-value rất nhỏ và R²-Adj trên tập train khoảng 0.65. 
+Tuy nhiên, do OLS sử dụng toàn bộ biến đầu vào nên có thể bị ảnh hưởng bởi đa cộng tuyến giữa các biến tổng như `total_rooms`, `total_bedrooms_imputed`, `population` và `households`, và thống kê t chỉ ra rằng, biến `total_bedrooms_imputed` có p-value không có ý nghĩa thống kê với mức alpha = 0.05
+
+
+```{r}
+pred_ols_full <- predict(
+  ols_full,
+  newdata = val_model
+)
+
+```
+
+
+
+###  OLS Stepwise
+
+```{r echo=TRUE}
+ols_step <- step(
+  ols_full,
+  direction = "both",
+  trace = 0
+)
+
+summary(ols_step)
+formula(ols_step)
+```
+
+OLS Stepwise loại bỏ biến `total_bedrooms_imputed` so với mô hình OLS Full. Kết quản của OLS Stepwise gần như tương đương OLS Full, cho thấy việc loại biến này không làm thay đổi đáng kể hiệu quả dự báo.  OLS Full được giữ làm mô hình OLS đại diện để so sánh với Ridge, LASSO và Elastic Net.
+
+#  Xây dựng mô hình Ridge, LASSO và Elastic Net
+
+##  Chuẩn bị ma trận dữ liệu cho
+
+```{r, echo = TRUE}
+# lib glmnet yêu cầu dữ liệu đầu vào là ma trận số
+# model.matrix() sẽ tự động dummy biến định tính ocean_proximity
+
+x_train <- model.matrix(
+  median_house_value ~ .,
+  data = train_model
+)[, -1]
+
+y_train <- train_model$median_house_value
+
+dim(x_train)
+length(y_train)
+```
+
+##  Thiết lập lưới lambda và K-fold
+
+```{r echo=TRUE}
+set.seed(995)
+
+#Lưới lambda tham khảo để vẽ coefficient path
+lambda_grid <- 10^seq(5, -2, length = 100)
+
+# Tạo fold cố định để các mô hình dùng cùng cách chia K-fold
+K <- 5
+
+fold_id <- sample(
+  rep(1:K, length.out = length(y_train))
+)
+```
+
+##  Ridge Regression
+
+```{r echo=TRUE}
+# Ridge Regression tương ứng với alpha = 0.
+# Ridge dùng điều chuẩn L2, giúp co nhỏ hệ số và giảm ảnh hưởng của đa cộng tuyến.
+
+ridge_model <- glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 0,
+  lambda = lambda_grid,
+  standardize = TRUE
+)
+
+plot(
+  ridge_model,
+  xvar = "lambda",
+  main = "Ridge Coefficient Path"
+)
+```
+
+```{r}
+# Sử dụng 5-fold Cross Validation để chọn lambda tối ưu cho Ridge.
+# cv.glmnet() sẽ tự chia training set thành 5 fold nhờ nfolds = K.
+# Ở bước này chưa dùng validation set bên ngoài.
+
+set.seed(26062026)
+
+cv_ridge <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 0,
+  nfolds = K,
+  type.measure = "mse",
+  standardize = TRUE
+)
+
+plot(cv_ridge)
+
+ridge_lambda_min <- cv_ridge$lambda.min
+ridge_lambda_1se <- cv_ridge$lambda.1se
+
+ridge_lambda_min
+ridge_lambda_1se
+```
+
+```{r echo=TRUE}
+# Xây dựng mô hình Ridge cuối cùng với lambda tối ưu được chọn từ K-fold CV.
+
+ridge_final <- glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 0,
+  lambda = ridge_lambda_min,
+  standardize = TRUE
+)
+
+ridge_coef <- as.matrix(coef(ridge_final))
+
+ridge_coef_table <- data.frame(
+  variable = rownames(ridge_coef),
+  coefficient = as.numeric(ridge_coef[, 1])
+)
+
+kable(ridge_coef_table, digits = 4)
+```
+
+
+Ridge Regression sử dụng điều chuẩn L2 với `alpha = 0`. Tham số `lambda` được lựa chọn bằng 5-fold Cross Validation trên tập train. Ridge giúp co nhỏ hệ số và giảm ảnh hưởng của đa cộng tuyến, nhưng không đưa hệ số về đúng 0 nên không thực hiện lựa chọn biến trực tiếp. Trên tập validation, Ridge có kết quả kém hơn nhẹ so với OLS, LASSO và Elastic Net.
+
+
+##  Lasso Regression
+
+```{r echo=TRUE}
+# LASSO Regression tương ứng với alpha = 1.
+# LASSO dùng điều chuẩn L1, có thể đưa một số hệ số về 0,
+# nên có khả năng hỗ trợ lựa chọn biến.
+
+lasso_model <- glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 1,
+  lambda = lambda_grid,
+  standardize = TRUE
+)
+
+plot(
+  lasso_model,
+  xvar = "lambda",
+  main = "LASSO Coefficient Path"
+)
+```
+```{r}
+# Sử dụng 5-fold Cross Validation để chọn lambda tối ưu cho LASSO.
+# cv.glmnet() thực hiện K-fold CV trực tiếp trên training set.
+
+set.seed(26062026)
+
+cv_lasso <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 1,
+  nfolds = K,
+  type.measure = "mse",
+  standardize = TRUE
+)
+
+plot(cv_lasso)
+
+lasso_lambda_min <- cv_lasso$lambda.min
+lasso_lambda_1se <- cv_lasso$lambda.1se
+
+lasso_lambda_min
+lasso_lambda_1se
+```
+
+```{r echo=TRUE}
+# Xây dựng mô hình LASSO cuối cùng với lambda tối ưu được chọn từ K-fold CV.
+
+lasso_final <- glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = 1,
+  lambda = lasso_lambda_min,
+  standardize = TRUE
+)
+
+lasso_coef <- as.matrix(coef(lasso_final))
+
+lasso_coef_table <- data.frame(
+  variable = rownames(lasso_coef),
+  coefficient = as.numeric(lasso_coef[, 1])
+) %>%
+  filter(coefficient != 0)
+
+kable(lasso_coef_table, digits = 4)
+```
+
+LASSO Regression sử dụng điều chuẩn L1 với `alpha = 1`, trong đó `lambda` được chọn bằng 5-fold Cross Validation. LASSO có khả năng co một số hệ số về 0, do đó hỗ trợ lựa chọn biến và giúp mô hình gọn hơn. Kết quả validation cho thấy LASSO là mô hình tốt nhất với RMSE, MAE, MAPE thấp nhất và R² cao nhất.
+
+
+##  Elastic Net Regression
+
+```{r echo=TRUE}
+# Elastic Net là sự kết hợp giữa Ridge và LASSO.
+# Alpha nằm trong khoảng (0, 1):
+# alpha gần 0 thì giống Ridge hơn,
+# alpha gần 1 thì giống LASSO hơn.
+# Với mỗi alpha, dùng 5-fold Cross Validation để chọn lambda tối ưu.
+
+alpha_grid <- seq(0.1, 0.9, by = 0.1)
+
+set.seed(26062026)
+
+enet_list <- lapply(alpha_grid, function(a) {
+  cv.glmnet(
+    x = x_train,
+    y = y_train,
+    alpha = a,
+    nfolds = K,
+    type.measure = "mse",
+    standardize = TRUE
+  )
+})
+```
+
+```{r}
+# Tổng hợp kết quả K-fold CV cho từng giá trị alpha.
+# min_cv_mse là MSE trung bình nhỏ nhất trên 5 fold.
+# Cặp alpha và lambda có min_cv_mse nhỏ nhất sẽ được chọn.
+
+enet_tuning <- data.frame(
+  alpha = alpha_grid,
+  min_cv_mse = sapply(enet_list, function(model) min(model$cvm)),
+  lambda_min = sapply(enet_list, function(model) model$lambda.min),
+  lambda_1se = sapply(enet_list, function(model) model$lambda.1se)
+)
+
+kable(enet_tuning, digits = 6)
+```
+
+```{r}
+# Chọn alpha và lambda tối ưu cho Elastic Net.
+
+best_id <- which.min(enet_tuning$min_cv_mse)
+
+enet_best_alpha <- enet_tuning$alpha[best_id]
+enet_lambda_min <- enet_tuning$lambda_min[best_id]
+enet_lambda_1se <- enet_tuning$lambda_1se[best_id]
+
+enet_best_alpha
+enet_lambda_min
+enet_lambda_1se
+```
+
+```{r echo=TRUE}
+# Xây dựng mô hình Elastic Net cuối cùng với alpha và lambda tối ưu
+# được chọn thông qua K-fold Cross Validation.
+
+enet_final <- glmnet(
+  x = x_train,
+  y = y_train,
+  alpha = enet_best_alpha,
+  lambda = enet_lambda_min,
+  standardize = TRUE
+)
+
+enet_coef <- as.matrix(coef(enet_final))
+
+enet_coef_table <- data.frame(
+  variable = rownames(enet_coef),
+  coefficient = as.numeric(enet_coef[, 1])
+) %>%
+  filter(coefficient != 0)
+
+kable(enet_coef_table, digits = 4)
+```
+
+Elastic Net kết hợp cả điều chuẩn L1 và L2. Bài làm thử nhiều giá trị `alpha` từ 0.1 đến 0.9, với mỗi giá trị `alpha` đều dùng 5-fold Cross Validation để chọn `lambda` tối ưu. Kết quả chọn được `alpha = 0.4`, cho thấy mô hình kết hợp giữa Ridge và LASSO. Elastic Net cho kết quả khá gần LASSO nhưng vẫn kém hơn nhẹ trên tập validation.
+
+```{r}
+# Tong hop cac tham so duoc dieu chinh toi uu
+regularization_summary <- data.frame(
+  Model = c("Ridge", "LASSO", "Elastic Net"),
+  Alpha = c(0, 1, enet_best_alpha),
+  Lambda_min = c(ridge_lambda_min, lasso_lambda_min, enet_lambda_min),
+  Lambda_1se = c(ridge_lambda_1se, lasso_lambda_1se, enet_lambda_1se)
+)
+
+kable(regularization_summary, digits = 6)
+```
+
+Ridge, LASSO và Elastic Net được xây dựng trên cùng bộ biến đầu vào với OLS. Do glmnet yêu cầu dữ liệu dạng ma trận số, biến ocean_proximity được mã hóa thành dummy variables bằng model.matrix().
+
+Đối với Ridge và LASSO, 5-fold Cross Validation được sử dụng để chọn lambda tối ưu. Ridge tương ứng với alpha = 0, còn LASSO tương ứng với alpha = 1.
+
+Đối với Elastic Net, bài làm thử nhiều giá trị alpha từ 0.1 đến 0.9. Với mỗi alpha, 5-fold Cross Validation được sử dụng để chọn lambda tối ưu. Cặp alpha và lambda cho MSE trung bình nhỏ nhất được chọn để xây dựng mô hình Elastic Net cuối cùng.
+
+#  Validation 
+
+```{r}
+# dùng validation set để đánh giá khả năng dự báo của các mô hình.
+# Các mô hình đã được xây dựng ở phần trước gồm:
+# OLS Full, OLS Stepwise, Ridge, LASSO và Elastic Net.
+
+# Tạo ma trận validation cho Ridge, LASSO và Elastic Net
+# model.matrix() tự động dummy biến ocean_proximity giống như ở training set.
+x_val <- model.matrix(
+  median_house_value ~ .,
+  data = val_model
+)[, -1]
+
+y_val <- val_model$median_house_value
+
+# 
+x_val <- x_val[, colnames(x_train), drop = FALSE]
+```
+
+```{r}
+# Hàm tính các chỉ số đánh giá mô hình trên validation set
+criteria_func <- function(actual, predicted) {
+  
+  data_eval <- data.frame(
+    actual = actual,
+    predicted = predicted
+  ) %>%
+    filter(
+      !is.na(actual),
+      !is.na(predicted)
+    )
+  
+  data.frame(
+    RMSE = sqrt(mean((data_eval$actual - data_eval$predicted)^2)),
+    MAE = mean(abs(data_eval$actual - data_eval$predicted)),
+    MAPE = mean(abs((data_eval$actual - data_eval$predicted) / data_eval$actual)) * 100,
+    R2 = 1 - sum((data_eval$actual - data_eval$predicted)^2) /
+      sum((data_eval$actual - mean(data_eval$actual))^2)
+  )
+}
+```
+
+
+```{r}
+# Dự báo bằng OLS Full
+pred_ols_full <- predict(
+  ols_full,
+  newdata = val_model
+)
+
+# Dự báo bằng OLS Stepwise
+pred_ols_step <- predict(
+  ols_step,
+  newdata = val_model
+)
+
+# Dự báo bằng Ridge Regression
+pred_ridge <- predict(
+  ridge_final,
+  newx = x_val
+)[, 1]
+
+# Dự báo bằng LASSO Regression
+pred_lasso <- predict(
+  lasso_final,
+  newx = x_val
+)[, 1]
+
+# Dự báo bằng Elastic Net Regression
+pred_enet <- predict(
+  enet_final,
+  newx = x_val
+)[, 1]
+```
+
+```{r}
+ols_full_metrics <- criteria_func(
+  actual = y_val,
+  predicted = pred_ols_full
+) %>%
+  mutate(Model = "OLS Full")
+
+ols_step_metrics <- criteria_func(
+  actual = y_val,
+  predicted = pred_ols_step
+) %>%
+  mutate(Model = "OLS Stepwise")
+
+ridge_metrics <- criteria_func(
+  actual = y_val,
+  predicted = pred_ridge
+) %>%
+  mutate(Model = "Ridge")
+
+lasso_metrics <- criteria_func(
+  actual = y_val,
+  predicted = pred_lasso
+) %>%
+  mutate(Model = "LASSO")
+
+enet_metrics <- criteria_func(
+  actual = y_val,
+  predicted = pred_enet
+) %>%
+  mutate(Model = paste0("Elastic Net alpha=", enet_best_alpha))
+```
+
+```{r}
+all_results <- bind_rows(
+  ols_full_metrics,
+  ols_step_metrics,
+  ridge_metrics,
+  lasso_metrics,
+  enet_metrics
+) %>%
+  select(Model, RMSE, MAE, MAPE, R2) %>%
+  arrange(RMSE)
+
+kable(all_results, digits = 6)
+```
+
+```{r}
+final_results <- bind_rows(
+  ols_full_metrics %>% mutate(Model = "OLS"),
+  ridge_metrics,
+  lasso_metrics,
+  enet_metrics
+) %>%
+  select(Model, RMSE, MAE, MAPE, R2) %>%
+  arrange(RMSE)
+
+kable(final_results, digits = 6)
+```
+
+#  So sánh các mô hình với nhau ở bộ biến ban đầu 
+
+```{r}
+# Bộ biến ban đầu sau khi xử lý missing
+
+train_model_raw <- train_model %>%
+  select(
+    median_house_value,
+    longitude,
+    latitude,
+    housing_median_age,
+    total_rooms,
+    total_bedrooms_imputed,
+    population,
+    households,
+    median_income,
+    ocean_proximity
+  )
+
+val_model_raw <- val_model %>%
+  select(
+    median_house_value,
+    longitude,
+    latitude,
+    housing_median_age,
+    total_rooms,
+    total_bedrooms_imputed,
+    population,
+    households,
+    median_income,
+    ocean_proximity
+  )
+
+# Đảm bảo ocean_proximity là factor và validation có cùng level với train
+train_model_raw$ocean_proximity <- relevel(
+  as.factor(train_model_raw$ocean_proximity),
+  ref = "INLAND"
+)
+
+val_model_raw$ocean_proximity <- factor(
+  val_model_raw$ocean_proximity,
+  levels = levels(train_model_raw$ocean_proximity)
+)
+
+# Kiểm tra missing
+colSums(is.na(train_model_raw))
+colSums(is.na(val_model_raw))
+```
+
+##  OLS
+
+```{r echo=TRUE}
+# OLS Full với bộ biến ban đầu
+ols_full_raw <- lm(
+  median_house_value ~ .,
+  data = train_model_raw
+)
+
+summary(ols_full_raw)
+
+# OLS Stepwise với bộ biến ban đầu
+ols_step_raw <- step(
+  ols_full_raw,
+  direction = "both",
+  trace = 0
+)
+
+summary(ols_step_raw)
+
+```
+##  Tiền xử lý chuẩn bị cho Ridge, Lasso và Elastic net
+
+```{r echo=TRUE}
+
+# model.matrix() sẽ tự dummy biến ocean_proximity
+
+x_train_raw <- model.matrix(
+  median_house_value ~ .,
+  data = train_model_raw
+)[, -1]
+
+y_train_raw <- train_model_raw$median_house_value
+
+x_val_raw <- model.matrix(
+  median_house_value ~ .,
+  data = val_model_raw
+)[, -1]
+
+y_val_raw <- val_model_raw$median_house_value
+
+# Đảm bảo validation có cùng cột với training
+x_val_raw <- x_val_raw[, colnames(x_train_raw), drop = FALSE]
+
+dim(x_train_raw)
+length(y_train_raw)
+```
+```{r}
+set.seed(995)
+
+# K = 5 cho K-fold Cross Validation
+# Dùng để chọn lambda tối ưu cho Ridge, LASSO và Elastic Net
+K <- 5
+```
+
+##  Ridge Regression
+
+```{r echo=TRUE}
+# Ridge Regression: alpha = 0
+# Sử dụng 5-fold Cross Validation để chọn lambda tối ưu
+
+set.seed(26062026)
+
+cv_ridge_raw <- cv.glmnet(
+  x = x_train_raw,
+  y = y_train_raw,
+  alpha = 0,
+  nfolds = K,
+  type.measure = "mse",
+  standardize = TRUE
+)
+
+plot(cv_ridge_raw)
+
+ridge_lambda_min_raw <- cv_ridge_raw$lambda.min
+ridge_lambda_1se_raw <- cv_ridge_raw$lambda.1se
+
+ridge_lambda_min_raw
+ridge_lambda_1se_raw
+
+ridge_final_raw <- glmnet(
+  x = x_train_raw,
+  y = y_train_raw,
+  alpha = 0,
+  lambda = ridge_lambda_min_raw,
+  standardize = TRUE
+)
+```
+##  Lasso Regression
+
+```{r echo=TRUE}
+# LASSO Regression: alpha = 1
+# Sử dụng 5-fold Cross Validation để chọn lambda tối ưu
+
+set.seed(26062026)
+
+cv_lasso_raw <- cv.glmnet(
+  x = x_train_raw,
+  y = y_train_raw,
+  alpha = 1,
+  nfolds = K,
+  type.measure = "mse",
+  standardize = TRUE
+)
+
+plot(cv_lasso_raw)
+
+lasso_lambda_min_raw <- cv_lasso_raw$lambda.min
+lasso_lambda_1se_raw <- cv_lasso_raw$lambda.1se
+
+lasso_lambda_min_raw
+lasso_lambda_1se_raw
+
+lasso_final_raw <- glmnet(
+  x = x_train_raw,
+  y = y_train_raw,
+  alpha = 1,
+  lambda = lasso_lambda_min_raw,
+  standardize = TRUE
+)
+```
+
+##  Elastic Net
+```{r echo=TRUE}
+# Elastic Net Regression: 0 < alpha < 1
+# Thử nhiều alpha; với mỗi alpha dùng 5-fold CV để chọn lambda tối ưu
+
+alpha_grid <- seq(0.1, 0.9, by = 0.1)
+
+set.seed(26062026)
+
+enet_list_raw <- lapply(alpha_grid, function(a) {
+  cv.glmnet(
+    x = x_train_raw,
+    y = y_train_raw,
+    alpha = a,
+    nfolds = K,
+    type.measure = "mse",
+    standardize = TRUE
+  )
+})
+
+enet_tuning_raw <- data.frame(
+  alpha = alpha_grid,
+  min_cv_mse = sapply(enet_list_raw, function(model) min(model$cvm)),
+  lambda_min = sapply(enet_list_raw, function(model) model$lambda.min),
+  lambda_1se = sapply(enet_list_raw, function(model) model$lambda.1se)
+)
+
+kable(enet_tuning_raw, digits = 6)
+
+best_id_raw <- which.min(enet_tuning_raw$min_cv_mse)
+
+enet_best_alpha_raw <- enet_tuning_raw$alpha[best_id_raw]
+enet_lambda_min_raw <- enet_tuning_raw$lambda_min[best_id_raw]
+enet_lambda_1se_raw <- enet_tuning_raw$lambda_1se[best_id_raw]
+
+enet_best_alpha_raw
+enet_lambda_min_raw
+enet_lambda_1se_raw
+
+enet_final_raw <- glmnet(
+  x = x_train_raw,
+  y = y_train_raw,
+  alpha = enet_best_alpha_raw,
+  lambda = enet_lambda_min_raw,
+  standardize = TRUE
+)
+```
+
+##  Đánh giá version dùng biến ban đầu
+
+```{r, include=FALSE}
+# Dự báo trên validation set
+
+pred_ols_full_raw <- predict(
+  ols_full_raw,
+  newdata = val_model_raw
+)
+
+pred_ols_step_raw <- predict(
+  ols_step_raw,
+  newdata = val_model_raw
+)
+
+pred_ridge_raw <- predict(
+  ridge_final_raw,
+  newx = x_val_raw
+)[, 1]
+
+pred_lasso_raw <- predict(
+  lasso_final_raw,
+  newx = x_val_raw
+)[, 1]
+
+pred_enet_raw <- predict(
+  enet_final_raw,
+  newx = x_val_raw
+)[, 1]
+```
+
+
+```{r, include=FALSE}
+# Tính metric cho từng mô hình
+
+ols_full_raw_metrics <- criteria_func(
+  actual = y_val_raw,
+  predicted = pred_ols_full_raw
+) %>%
+  mutate(Model = "OLS Raw")
+
+ols_step_raw_metrics <- criteria_func(
+  actual = y_val_raw,
+  predicted = pred_ols_step_raw
+) %>%
+  mutate(Model = "OLS Stepwise Raw")
+
+ridge_raw_metrics <- criteria_func(
+  actual = y_val_raw,
+  predicted = pred_ridge_raw
+) %>%
+  mutate(Model = "Ridge Raw")
+
+lasso_raw_metrics <- criteria_func(
+  actual = y_val_raw,
+  predicted = pred_lasso_raw
+) %>%
+  mutate(Model = "LASSO Raw")
+
+enet_raw_metrics <- criteria_func(
+  actual = y_val_raw,
+  predicted = pred_enet_raw
+) %>%
+  mutate(Model = paste0("Elastic Net Raw alpha=", enet_best_alpha_raw))
+```
+
+```{r}
+# Bảng kết quả version dùng biến ban đầu
+
+raw_results <- bind_rows(
+  ols_full_raw_metrics,
+  ols_step_raw_metrics,
+  ridge_raw_metrics,
+  lasso_raw_metrics,
+  enet_raw_metrics
+) %>%
+  select(Model, RMSE, MAE, MAPE, R2) %>%
+  arrange(RMSE)
+
+kable(raw_results, digits = 6)
+```
+
+```{r}
+# So sánh mô hình chính dùng Feature Engineering và mô hình dùng biến ban đầu
+
+compare_raw_fe <- bind_rows(
+  final_results %>% mutate(Version = "With Feature Engineering"),
+  raw_results %>% mutate(Version = "Raw variables")
+) %>%
+  filter(Model != "OLS Stepwise Raw") %>%
+  select(Version, Model, RMSE, MAE, MAPE, R2) %>%
+  arrange(RMSE)
+
+kable(compare_raw_fe, digits = 6)
+```
+
+# Đánh giá và lựa chọn mô hình 
+
+```{r}
+# Dự báo trên tập train bằng các mô hình đã xây dựng
+
+pred_ols_train <- predict(
+  ols_full,
+  newdata = train_model
+)
+
+pred_ridge_train <- predict(
+  ridge_final,
+  newx = x_train
+)[, 1]
+
+pred_lasso_train <- predict(
+  lasso_final,
+  newx = x_train
+)[, 1]
+
+pred_enet_train <- predict(
+  enet_final,
+  newx = x_train
+)[, 1]
+
+# Tính chỉ số trên tập train
+
+train_results <- bind_rows(
+  criteria_func(
+    actual = y_train,
+    predicted = pred_ols_train
+  ) %>%
+    mutate(Model = "OLS", Dataset = "Train"),
+  
+  criteria_func(
+    actual = y_train,
+    predicted = pred_ridge_train
+  ) %>%
+    mutate(Model = "Ridge", Dataset = "Train"),
+  
+  criteria_func(
+    actual = y_train,
+    predicted = pred_lasso_train
+  ) %>%
+    mutate(Model = "LASSO", Dataset = "Train"),
+  
+  criteria_func(
+    actual = y_train,
+    predicted = pred_enet_train
+  ) %>%
+    mutate(Model = paste0("Elastic Net alpha=", enet_best_alpha), Dataset = "Train")
+) %>%
+  select(Model, Dataset, RMSE, MAE, MAPE, R2)
+
+kable(train_results, digits = 6)
+
+val_results <- all_results %>%
+  mutate(
+    Dataset = "Validation",
+    Model = ifelse(Model == "OLS Full", "OLS", Model)
+  ) %>%
+  filter(Model != "OLS Stepwise") %>%
+  select(Model, Dataset, RMSE, MAE, MAPE, R2)
+
+train_val_results <- bind_rows(
+  train_results,
+  val_results
+) %>%
+  arrange(Model, Dataset)
+
+kable(train_val_results, digits = 6)
+
+
+```
+
+
+Việc lựa chọn mô hình được thực hiện dựa trên kết quả đánh giá trên tập validation, thông qua các chỉ số RMSE, MAE, MAPE và R².
+
+Kết quả cho thấy các mô hình có Feature Engineering đều cho hiệu quả dự báo tốt hơn so với các mô hình chỉ dùng biến ban đầu. Điều này cho thấy các biến tỷ lệ được tạo thêm như rooms_per_household, bedrooms_per_room và population_per_household có đóng góp tích cực vào khả năng dự báo.
+
+Trong tất cả các mô hình, LASSO với Feature Engineering cho kết quả tốt nhất, với xấp xỉ của RMSE là 67500, MAE là 48400, MAPE = 28.25% và R² = 0.650 (trên tập val). Mặc dù mức cải thiện so với OLS không quá lớn, LASSO vẫn cho kết quả tốt hơn một cách nhất quán trên các chỉ số đánh giá.
+
+Ngoài ra, LASSO sử dụng điều chuẩn L1, có khả năng co một số hệ số về 0, giúp mô hình gọn hơn và hạn chế ảnh hưởng của các biến ít quan trọng. Do đó, **LASSO với Feature Engineering được lựa chọn là mô hình phù hợp nhất trong bài làm này.**
+
+```{r}
+# Hàm lấy số hệ số khác 0 từ mô hình lm
+formula(ols_full)
+formula(ols_step)
+```
+```{r}
+# lasso
+lasso_selected_variables <- as.matrix(coef(lasso_final)) %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  rename(Coefficient = s0) %>%
+  filter(
+    Variable != "(Intercept)",
+    abs(Coefficient) > 1e-8
+  )
+
+kable(lasso_selected_variables, digits = 4)
+```
+
+#  Diễn giải các biến ảnh hưởng đến giá nhà ở California dựa trên mô hình đã chọn
+
+```{r}
+kable(lasso_coef_table, digits = 4)
+```
+
+Dựa trên hệ số của mô hình LASSO, giá nhà ở California chịu ảnh hưởng chủ yếu bởi `median_income`, vị trí địa lý và các biến Feature Engineering.
+
+`median_income` có hệ số dương lớn, cho thấy khu vực có thu nhập trung vị cao hơn thường có giá nhà cao hơn. Các biến `longitude`, `latitude` và `ocean_proximity` cho thấy giá nhà thay đổi rõ theo vị trí; trong đó các khu vực gần biển hoặc gần vịnh có giá cao hơn so với nhóm `INLAND`.
+
+Ngoài ra, các biến `rooms_per_household` và `bedrooms_per_room` có hệ số dương, cho thấy đặc điểm cấu trúc nhà ở cũng góp phần làm tăng giá nhà. Nhìn chung, các yếu tố quan trọng nhất là thu nhập, vị trí, khoảng cách đến biển và đặc điểm nhà ở.
+
+# Trình bày kết luận và đề xuất
+
+
+Bài làm đã xây dựng và so sánh các mô hình OLS, Ridge Regression, LASSO Regression và Elastic Net Regression để dự báo giá nhà trung vị tại California. Đối với Ridge, LASSO và Elastic Net, K-fold Cross Validation được sử dụng trên tập train để lựa chọn tham số điều chuẩn tối ưu.
+
+Kết quả cho thấy các mô hình có Feature Engineering cho hiệu quả dự báo tốt hơn so với các mô hình chỉ dùng biến ban đầu. Trong đó, LASSO với Feature Engineering cho kết quả tốt nhất trên tập validation, với RMSE xấp xỉ khoảng 67500, MAE trong khoảng 48400, MAPE khoảng 28.25% và R² = 0.650.
+
+Bảng so sánh giữa tập train và validation cho thấy sai số của hai tập không chênh lệch quá lớn, cho thấy mô hình không có dấu hiệu overfitting nghiêm trọng. Ngoài ra, LASSO sử dụng điều chuẩn L1, có khả năng co một số hệ số về 0, giúp mô hình gọn hơn và hạn chế ảnh hưởng của các biến ít quan trọng. Do đó, **LASSO với Feature Engineering được lựa chọn là mô hình phù hợp nhất trong bài làm này.**
+
+Về đề xuất, có thể cải thiện mô hình bằng cách tiếp tục xây dựng thêm các biến liên quan đến vị trí địa lý, xử lý hiện tượng giá nhà bị chặn trên ở mức 500,001 hoặc thử nghiệm các mô hình phi tuyến như Random Forest, Gradient Boosting hoặc XGBoost để nâng cao khả năng dự báo.
+
+
