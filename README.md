@@ -83,13 +83,15 @@ Trong các mô hình được so sánh, LASSO với Feature Engineering cho kế
 
 ## Công cụ sử dụng
 
-Dự án được thực hiện bằng R với một số thư viện chính:
-
-* `tidyverse`
-* `ggplot2`
-* `glmnet`
-* `broom`
-* `corrplot`
-* `car`
-* `knitr`
+```r
+library(tidyverse)
+library(corrplot)
+library(broom)
+library(knitr)
+library(maps)
+library(viridis)
+library(scales)
+library(GGally)
+library(car)
+library(glmnet)
 
